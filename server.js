@@ -103,7 +103,12 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
-      console.log(`📩 رسالة من Extension:`, msg);
+      if (msg.type === "ping") {
+        // رد فوري على الـ ping
+        ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
+      } else {
+        console.log(`📩 رسالة من Extension:`, msg);
+      }
     } catch (e) {
       console.log(`📩 رسالة نصية من Extension: ${data}`);
     }
