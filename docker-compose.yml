@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  ws-server:
+    build: .
+    ports:
+      - "3055:3055"
+    environment:
+      - PORT=3055
+      - SECRET_TOKEN=hamza-secret-2024
+    restart: unless-stopped
