@@ -2,150 +2,199 @@ const WebSocket = require("ws");
 const http = require("http");
 
 // ============================================
-// الإعدادات - غيّرها حسب احتياجك
+// الإعدادات
 // ============================================
 const PORT = process.env.PORT || 3055;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || "hamza-secret-2024";
+const MASTER_TOKEN = process.env.SECRET_TOKEN || "hamza-secret-2024";
 
 // ============================================
-// تخزين النتائج القادمة من Extension
+// تخزين البيانات
 // ============================================
-const pendingResults = new Map(); // commandId -> { resolve, timer }
-let lastResult = null;
+
+// extensions: Map<extensionToken, { ws, ip, connectedAt, lastSeen }>
+const extensions = new Map();
+
+// نتائج الأوامر: Map<commandId, { resolve, timer }>
+const pendingResults = new Map();
+
+// آخر نتيجة لكل extension
+const lastResults = new Map(); // extensionToken -> lastResult
 
 function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
 // ============================================
-// إنشاء HTTP Server (لاستقبال n8n)
+// HTTP Server
 // ============================================
 const server = http.createServer((req, res) => {
-  // Health check
+  const headers = { "Content-Type": "application/json" };
+
+  // ── GET /health ──
   if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        extensions_connected: extensions.size,
-        timestamp: new Date().toISOString(),
-      })
-    );
+    const connected = {};
+    extensions.forEach((ext, token) => {
+      connected[token] = {
+        ip: ext.ip,
+        connectedAt: ext.connectedAt,
+        lastSeen: ext.lastSeen,
+        status: ext.ws.readyState === WebSocket.OPEN ? "online" : "offline",
+      };
+    });
+    res.writeHead(200, headers);
+    res.end(JSON.stringify({
+      status: "ok",
+      extensions_connected: extensions.size,
+      extensions: connected,
+      timestamp: new Date().toISOString(),
+    }));
     return;
   }
 
-  // استقبال الأوامر من n8n
-  if (req.method === "POST" && req.url === "/send-command") {
-    // التحقق من التوكن
-    const token = req.headers["x-secret-token"];
-    if (token !== SECRET_TOKEN) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - Invalid Token" }));
+  // ── GET /list-extensions ── (يحتاج master token)
+  if (req.method === "GET" && req.url === "/list-extensions") {
+    if (req.headers["x-master-token"] !== MASTER_TOKEN) {
+      res.writeHead(401, headers);
+      res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
     }
+    const list = [];
+    extensions.forEach((ext, token) => {
+      list.push({
+        token,
+        ip: ext.ip,
+        connectedAt: ext.connectedAt,
+        lastSeen: ext.lastSeen,
+        online: ext.ws.readyState === WebSocket.OPEN,
+      });
+    });
+    res.writeHead(200, headers);
+    res.end(JSON.stringify({ extensions: list, total: list.length }));
+    return;
+  }
 
+  // تحقق من body للـ POST requests
+  const readBody = (cb) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
-      try {
-        const command = JSON.parse(body);
-        console.log(`📨 أمر جديد من n8n:`, command);
-
-        // إرسال الأمر لجميع Extensions المتصلة
-        if (extensions.size === 0) {
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({ error: "No extensions connected", sent: 0 })
-          );
-          return;
-        }
-
-        let sent = 0;
-        extensions.forEach((ext) => {
-          if (ext.readyState === WebSocket.OPEN) {
-            ext.send(JSON.stringify(command));
-            sent++;
-          }
-        });
-
-        console.log(`✅ تم إرسال الأمر لـ ${sent} Extension`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: true,
-            sent_to: sent,
-            command: command,
-          })
-        );
-      } catch (e) {
-        res.writeHead(400, { "Content-Type": "application/json" });
+      try { cb(JSON.parse(body)); }
+      catch (e) {
+        res.writeHead(400, headers);
         res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
       }
+    });
+  };
+
+  // دالة إرسال الأمر لـ extension محددة أو كل الـ extensions
+  const sendToExtension = (command, extensionToken) => {
+    if (extensionToken) {
+      // إرسال لـ extension محددة بتوكنها
+      const ext = extensions.get(extensionToken);
+      if (!ext || ext.ws.readyState !== WebSocket.OPEN) {
+        return { sent: 0, error: `Extension "${extensionToken}" not connected` };
+      }
+      ext.ws.send(JSON.stringify(command));
+      return { sent: 1, target: extensionToken };
+    } else {
+      // إرسال لجميع الـ extensions
+      let sent = 0;
+      extensions.forEach((ext) => {
+        if (ext.ws.readyState === WebSocket.OPEN) {
+          ext.ws.send(JSON.stringify(command));
+          sent++;
+        }
+      });
+      return { sent, target: "all" };
+    }
+  };
+
+  // ── POST /send-command ──
+  if (req.method === "POST" && req.url === "/send-command") {
+    if (req.headers["x-master-token"] !== MASTER_TOKEN) {
+      res.writeHead(401, headers);
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    readBody((command) => {
+      const extensionToken = req.headers["x-extension-token"] || null;
+      if (extensions.size === 0) {
+        res.writeHead(503, headers);
+        res.end(JSON.stringify({ error: "No extensions connected" }));
+        return;
+      }
+      const result = sendToExtension(command, extensionToken);
+      if (result.error) {
+        res.writeHead(404, headers);
+        res.end(JSON.stringify({ error: result.error }));
+        return;
+      }
+      console.log(`📨 أمر → ${result.target} (${result.sent} extension)`);
+      res.writeHead(200, headers);
+      res.end(JSON.stringify({ success: true, ...result, command }));
     });
     return;
   }
 
-  // استرجاع آخر نتيجة من Extension
-  if (req.method === "GET" && req.url === "/get-result") {
-    const token = req.headers["x-secret-token"];
-    if (token !== SECRET_TOKEN) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized" }));
-      return;
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ result: lastResult }));
-    return;
-  }
-
-  // إرسال أمر والانتظار حتى النتيجة (timeout 10 ثواني)
+  // ── POST /execute ── (ينتظر النتيجة)
   if (req.method === "POST" && req.url === "/execute") {
-    const token = req.headers["x-secret-token"];
-    if (token !== SECRET_TOKEN) {
-      res.writeHead(401, { "Content-Type": "application/json" });
+    if (req.headers["x-master-token"] !== MASTER_TOKEN) {
+      res.writeHead(401, headers);
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
     }
+    readBody((command) => {
+      const extensionToken = req.headers["x-extension-token"] || null;
 
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
-      try {
-        const command = JSON.parse(body);
-        const commandId = generateId();
-        command.commandId = commandId;
+      if (extensions.size === 0) {
+        res.writeHead(503, headers);
+        res.end(JSON.stringify({ error: "No extensions connected" }));
+        return;
+      }
 
-        if (extensions.size === 0) {
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No extensions connected" }));
-          return;
-        }
+      const commandId = generateId();
+      command.commandId = commandId;
 
-        // انتظار النتيجة
-        const timer = setTimeout(() => {
-          pendingResults.delete(commandId);
-          res.writeHead(408, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Timeout - no response from extension" }));
-        }, 10000);
+      const result = sendToExtension(command, extensionToken);
+      if (result.error) {
+        res.writeHead(404, headers);
+        res.end(JSON.stringify({ error: result.error }));
+        return;
+      }
 
-        pendingResults.set(commandId, { resolve: (result) => {
+      // انتظار النتيجة 15 ثانية
+      const timer = setTimeout(() => {
+        pendingResults.delete(commandId);
+        res.writeHead(408, headers);
+        res.end(JSON.stringify({ error: "Timeout - no response from extension" }));
+      }, 15000);
+
+      pendingResults.set(commandId, {
+        resolve: (cmdResult) => {
           clearTimeout(timer);
           pendingResults.delete(commandId);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, result }));
-        }, timer });
-
-        extensions.forEach((ext) => {
-          if (ext.readyState === WebSocket.OPEN) {
-            ext.send(JSON.stringify(command));
-          }
-        });
-
-      } catch (e) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
-      }
+          res.writeHead(200, headers);
+          res.end(JSON.stringify({ success: true, result: cmdResult, target: result.target }));
+        },
+        timer,
+      });
     });
+    return;
+  }
+
+  // ── GET /get-result ── (آخر نتيجة لـ extension محددة)
+  if (req.method === "GET" && req.url === "/get-result") {
+    if (req.headers["x-master-token"] !== MASTER_TOKEN) {
+      res.writeHead(401, headers);
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    const extensionToken = req.headers["x-extension-token"] || null;
+    const result = extensionToken
+      ? lastResults.get(extensionToken)
+      : Object.fromEntries(lastResults);
+    res.writeHead(200, headers);
+    res.end(JSON.stringify({ result: result || null }));
     return;
   }
 
@@ -154,56 +203,78 @@ const server = http.createServer((req, res) => {
 });
 
 // ============================================
-// WebSocket Server (للـ Chrome Extension)
+// WebSocket Server
 // ============================================
 const wss = new WebSocket.Server({ server });
-const extensions = new Set();
 
 wss.on("connection", (ws, req) => {
   const ip = req.socket.remoteAddress;
-  console.log(`🔌 Extension متصلة من: ${ip}`);
-  extensions.add(ws);
 
-  // إرسال رسالة ترحيب
-  ws.send(
-    JSON.stringify({
-      type: "connected",
-      message: "متصل بالسيرفر بنجاح",
-      timestamp: new Date().toISOString(),
-    })
-  );
+  // الـ Extension ترسل توكنها في الـ URL: wss://server/?token=xxx
+  const url = new URL(req.url, "http://localhost");
+  const extensionToken = url.searchParams.get("token");
 
-  // استقبال رسائل من Extension (مثل تأكيد تنفيذ الأمر)
+  if (!extensionToken) {
+    console.log(`❌ اتصال بدون token من ${ip}`);
+    ws.close(1008, "Token required");
+    return;
+  }
+
+  // إذا كان التوكن موجود مسبقاً، أغلق الاتصال القديم
+  if (extensions.has(extensionToken)) {
+    const old = extensions.get(extensionToken);
+    if (old.ws.readyState === WebSocket.OPEN) {
+      old.ws.close(1000, "Replaced by new connection");
+    }
+  }
+
+  const extData = {
+    ws,
+    ip,
+    token: extensionToken,
+    connectedAt: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+  };
+
+  extensions.set(extensionToken, extData);
+  console.log(`🔌 Extension متصلة | token: ${extensionToken} | ip: ${ip} | إجمالي: ${extensions.size}`);
+
+  ws.send(JSON.stringify({
+    type: "connected",
+    message: "متصل بالسيرفر بنجاح",
+    token: extensionToken,
+    timestamp: new Date().toISOString(),
+  }));
+
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
+      extData.lastSeen = new Date().toISOString();
+
       if (msg.type === "ping") {
         ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
       } else if (msg.type === "command_result") {
-        // حفظ النتيجة
-        lastResult = { ...msg, receivedAt: new Date().toISOString() };
-        console.log("📩 نتيجة من Extension:", msg);
-        // إرسالها للـ pending request إذا وجد
+        lastResults.set(extensionToken, { ...msg, receivedAt: new Date().toISOString() });
+        console.log(`📩 نتيجة من [${extensionToken}]:`, msg.result);
         if (msg.commandId && pendingResults.has(msg.commandId)) {
           pendingResults.get(msg.commandId).resolve(msg.result);
         }
-      } else {
-        console.log(`📩 رسالة من Extension:`, msg);
+      } else if (msg.type === "extension_hello") {
+        console.log(`👋 Extension [${extensionToken}] أرسلت hello`);
       }
     } catch (e) {
-      console.log(`📩 رسالة نصية من Extension: ${data}`);
+      console.log(`📩 رسالة غير JSON من [${extensionToken}]: ${data}`);
     }
   });
 
-  // عند قطع الاتصال
   ws.on("close", () => {
-    extensions.delete(ws);
-    console.log(`❌ Extension قطعت الاتصال. المتبقي: ${extensions.size}`);
+    extensions.delete(extensionToken);
+    console.log(`❌ [${extensionToken}] قطع الاتصال | المتبقي: ${extensions.size}`);
   });
 
   ws.on("error", (err) => {
-    console.error(`⚠️ خطأ في Extension:`, err.message);
-    extensions.delete(ws);
+    console.error(`⚠️ خطأ في [${extensionToken}]:`, err.message);
+    extensions.delete(extensionToken);
   });
 });
 
@@ -212,23 +283,27 @@ wss.on("connection", (ws, req) => {
 // ============================================
 server.listen(PORT, () => {
   console.log(`
-  ╔══════════════════════════════════════╗
-  ║     WebSocket Server يعمل! 🚀        ║
-  ╠══════════════════════════════════════╣
-  ║  Port     : ${PORT}                     ║
-  ║  Token    : ${SECRET_TOKEN}    ║
-  ╠══════════════════════════════════════╣
-  ║  Endpoints:                          ║
-  ║  GET  /health        → فحص الحالة   ║
-  ║  POST /send-command  → إرسال أمر    ║
-  ║  WS   ws://...       → للـ Extension ║
-  ╚══════════════════════════════════════╝
+  ╔══════════════════════════════════════════╗
+  ║   Browser Commander Server 🚀            ║
+  ╠══════════════════════════════════════════╣
+  ║  Port         : ${PORT}                     ║
+  ║  Master Token : ${MASTER_TOKEN}   ║
+  ╠══════════════════════════════════════════╣
+  ║  Endpoints:                              ║
+  ║  GET  /health           → حالة السيرفر  ║
+  ║  GET  /list-extensions  → كل الـ tokens ║
+  ║  POST /send-command     → إرسال أمر     ║
+  ║  POST /execute          → أمر + نتيجة  ║
+  ║  GET  /get-result       → آخر نتيجة    ║
+  ╠══════════════════════════════════════════╣
+  ║  Headers:                                ║
+  ║  x-master-token    → للتحقق            ║
+  ║  x-extension-token → تحديد Extension   ║
+  ╚══════════════════════════════════════════╝
   `);
 });
 
-// إيقاف نظيف
 process.on("SIGTERM", () => {
-  console.log("إيقاف السيرفر...");
   wss.close();
   server.close();
 });
