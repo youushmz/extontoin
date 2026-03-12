@@ -198,6 +198,60 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── GET /proxy-file?url=... ── تحميل ملف وإرساله للـ Extension
+  if (req.method === "GET" && req.url.startsWith("/proxy-file")) {
+    const urlObj = new URL(req.url, "http://localhost");
+    const fileUrl = urlObj.searchParams.get("url");
+
+    if (!fileUrl) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "url parameter required" }));
+      return;
+    }
+
+    try {
+      const https = require("https");
+      const http2 = require("http");
+      const urlParsed = new URL(fileUrl);
+      const client = urlParsed.protocol === "https:" ? https : http2;
+
+      const proxyReq = client.get(fileUrl, (proxyRes) => {
+        // تتبع redirects
+        if (proxyRes.statusCode === 302 || proxyRes.statusCode === 301) {
+          const redirectUrl = proxyRes.headers.location;
+          const redirectReq = client.get(redirectUrl, (redirectRes) => {
+            res.writeHead(200, {
+              "Content-Type": redirectRes.headers["content-type"] || "application/octet-stream",
+              "Access-Control-Allow-Origin": "*",
+              "Content-Disposition": "attachment",
+            });
+            redirectRes.pipe(res);
+          });
+          redirectReq.on("error", (e) => {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: e.message }));
+          });
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": proxyRes.headers["content-type"] || "application/octet-stream",
+          "Access-Control-Allow-Origin": "*",
+          "Content-Disposition": "attachment",
+        });
+        proxyRes.pipe(res);
+      });
+
+      proxyReq.on("error", (e) => {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: e.message }));
+      });
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not Found");
 });
